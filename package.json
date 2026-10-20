@@ -1,0 +1,15 @@
+{
+  "name": "@codeflow/server",
+  "version": "1.0.0",
+  "description": "Lightweight workflow runtime and API gateway",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED"
+}
