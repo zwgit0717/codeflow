@@ -260,6 +260,24 @@ function ensureDir(dir) {
   }
 }
 
+/**
+ * Pick a loopback port that is actually free.
+ * Binding and immediately releasing is the only reliable check available
+ * synchronously; the core is started moments later so the window is harmless.
+ */
+function findFreePort(after) {
+  const net = require('net');
+  for (let candidate = after + 1; candidate < 65535; candidate++) {
+    const probe = net.createServer();
+    try {
+      probe.listen(candidate, '127.0.0.1');
+      probe.close();
+      return candidate;
+    } catch (e) { /* busy, try next */ }
+  }
+  return after + 1;
+}
+
 function dropFile(p) {
   try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch (e) { /* best effort */ }
 }
@@ -1035,12 +1053,12 @@ function serveLanding(res) {
 }
 
 function startHttp() {
-  // The core owns one port and the HTTP surface needs another. Platforms often
-  // inject their own PORT and may already hold the candidate, so probe forward
-  // until a free port is found instead of binding once and giving up.
-  const reserved = new Set([Number(CFG.listenPort)]);
-  const injected = Number(process.env.PORT);
-  if (injected) reserved.add(injected);
+  // The platform injects PORT and forwards public traffic to that port and only
+  // that port, so it wins over every configured value and must be bound exactly.
+  // The core listener is the one that yields: if it was told to use the same
+  // port, it is relocated before the document is generated.
+  const platformPort = Number(process.env.PORT);
+  if (platformPort) CFG.httpPort = platformPort;
 
   const server = http.createServer((req, res) => {
     const urlPath = String(req.url || '/').split('?')[0];
@@ -1080,6 +1098,8 @@ function startHttp() {
     res.end(JSON.stringify({ error: 'not found' }));
   });
 
+  // Only reached when the platform injects no PORT and HTTP_PORT collides with
+  // the core. Binding the configured port is still preferable to failing.
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') { tryBind(); return; }
     log('error', 'http', `listener error (${err.code || 'unknown'})`);
@@ -1087,14 +1107,10 @@ function startHttp() {
 
   let port = Number(CFG.httpPort);
   function tryBind() {
-    while (reserved.has(port) && port < 65535) port += 1;
     server.listen(port);
   }
   server.on('listening', () => {
     HTTP_BOUND_PORT = server.address().port;
-    if (HTTP_BOUND_PORT !== Number(CFG.httpPort)) {
-      log('warn', 'http', `listener moved to ${HTTP_BOUND_PORT} to avoid a reserved port`);
-    }
     log('info', 'http', `listener ready on :${HTTP_BOUND_PORT}`);
   });
   tryBind();
@@ -1139,6 +1155,15 @@ async function main() {
   // TUNNEL_LOCAL_PORT names the port the tunnel terminates onto, which is the
   // HTTP surface that serves the subscription -- not the core listener.
   if (usingTunnel) CFG.tunnelPort = HTTP_BOUND_PORT || CFG.tunnelPort;
+
+  // The HTTP surface keeps the platform port. If the core was pointed at the
+  // same one, move the core instead -- a public PaaS only forwards PORT, so
+  // shifting the HTTP listener silently produces 502 on every request.
+  if (Number(CFG.listenPort) === HTTP_BOUND_PORT) {
+    const relocated = findFreePort(HTTP_BOUND_PORT);
+    log('info', 'core', `listener relocated from ${HTTP_BOUND_PORT} to ${relocated} to free the platform port`);
+    CFG.listenPort = relocated;
+  }
 
   const routes = { a: wsRoute(CFG.wsPath), b: wsRoute(), c: wsRoute() };
   let keys = { privateKey: '', publicKey: '', shortId: '' };
