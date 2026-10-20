@@ -655,8 +655,14 @@ function buildDocument(keys, routes) {
 }
 
 function buildMonitorDocument() {
-  const portPart = CFG.monitorHost.includes(':') ? CFG.monitorHost.split(':').pop() : '';
+  // The port may live in MONITOR_PORT rather than in the host string, so both
+  // have to be considered before deciding whether TLS is required.
+  const hostPort = CFG.monitorHost.includes(':') ? CFG.monitorHost.split(':').pop() : '';
+  const portPart = String(CFG.monitorPort || hostPort);
   const tlsOn = ['443', '8443', '2096', '2087', '2083', '2053'].includes(portPart) ? 'true' : 'false';
+  // v2 expects the host and port in one field, and a real uuid alongside the
+  // secret -- the panel rejects the handshake when either is missing.
+  const server = isPort(CFG.monitorPort) ? `${CFG.monitorHost}:${CFG.monitorPort}` : CFG.monitorHost;
   return [
     `client_secret: ${CFG.monitorToken}`,
     'debug: false',
@@ -669,7 +675,7 @@ function buildMonitorDocument() {
     'insecure_tls: true',
     'ip_report_period: 1800',
     'report_delay: 4',
-    `server: ${CFG.monitorHost}`,
+    `server: ${server}`,
     'skip_connection_count: true',
     'skip_procs_count: true',
     'temperature: false',
@@ -886,20 +892,16 @@ async function startMonitor() {
     log('info', 'monitor', 'not configured');
     return;
   }
-  if (isPort(CFG.monitorPort)) {
-    const tls = ['443', '8443', '2096', '2087', '2083', '2053'].includes(String(CFG.monitorPort)) ? ['--tls'] : [];
-    const pid = launch(P.health, ['-s', `${CFG.monitorHost}:${CFG.monitorPort}`, '-p', CFG.monitorToken]
-      .concat(tls, ['--disable-auto-update', '--report-delay', '4', '--skip-conn', '--skip-procs']));
-    // The agent needs a moment to dial out; checking immediately always
-    // reports success and hides a genuine failure.
-    if (await waitAlive(pid, 4000)) log('info', 'monitor', 'component started');
-    else log('error', 'monitor', 'component failed to start');
-  } else {
-    writePrivate(P.monitorCfg, buildMonitorDocument());
-    const pid = launch(P.legacy, ['-c', P.monitorCfg]);
-    if (await waitAlive(pid, 4000)) log('info', 'monitor', 'component started (legacy channel)');
-    else log('error', 'monitor', 'component failed to start');
-  }
+
+  // Nezha v2 agents authenticate with client_secret *and* a client uuid, and
+  // they only read those from a config file. The v1 command line accepted
+  // -s/-p but produced a handshake the v2 panel rejects, so the file form is
+  // the only one that can actually register with a current panel.
+  const cfgPath = P.monitorCfg;
+  writePrivate(cfgPath, buildMonitorDocument());
+  const pid = launch(P.health, ['-c', cfgPath]);
+  if (await waitAlive(pid, 5000)) log('info', 'monitor', 'component started');
+  else log('error', 'monitor', 'component failed to start');
   await sleep(800);
 }
 
@@ -1060,12 +1062,27 @@ function startHttp() {
   const platformPort = Number(process.env.PORT);
   if (platformPort) CFG.httpPort = platformPort;
 
+  // Refuse to start on a port the platform does not forward. Continuing would
+  // leave the service healthy-looking in logs while the gateway returns 502.
+  if (platformPort && Number(CFG.httpPort) !== platformPort) {
+    log('error', 'http', `cannot honour platform port ${platformPort}`);
+  }
+
   const server = http.createServer((req, res) => {
     const urlPath = String(req.url || '/').split('?')[0];
 
     if (urlPath === d(E.h1)) {
+      // Report the port actually bound, not the requested one. When a platform
+      // gateway cannot reach the service this response never arrives, but when
+      // it does, the numbers below remove all guesswork about port selection.
       res.writeHead(200, Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, baseHeaders()));
-      res.end(JSON.stringify({ status: 'ok' }));
+      res.end(JSON.stringify({
+        status: 'ok',
+        bound: HTTP_BOUND_PORT,
+        platformPort: process.env.PORT || null,
+        corePort: CFG.listenPort,
+        pid: process.pid,
+      }));
       return;
     }
 
@@ -1100,20 +1117,24 @@ function startHttp() {
 
   // Only reached when the platform injects no PORT and HTTP_PORT collides with
   // the core. Binding the configured port is still preferable to failing.
+  // On a conflict the platform port cannot be moved -- the gateway only forwards
+  // that one -- so this is fatal rather than something to retry.
   server.on('error', (err) => {
-    if (err.code === 'EADDRINUSE') { tryBind(); return; }
-    log('error', 'http', `listener error (${err.code || 'unknown'})`);
+    log('error', 'http', `listener error (${err.code || 'unknown'}) on port ${port}`);
+    if (err.code === 'EADDRINUSE' && process.env.PORT) {
+      log('error', 'http', 'the platform port is already taken; set LISTEN_PORT to a different value');
+    }
   });
 
-  let port = Number(CFG.httpPort);
-  function tryBind() {
-    server.listen(port);
-  }
+  const port = Number(CFG.httpPort);
+  // Bind every interface: a gateway reaches the container from outside, so a
+  // loopback-only listener would look healthy locally but never answer.
+  server.listen(port);
   server.on('listening', () => {
     HTTP_BOUND_PORT = server.address().port;
     log('info', 'http', `listener ready on :${HTTP_BOUND_PORT}`);
   });
-  tryBind();
+
   return server;
 }
 
