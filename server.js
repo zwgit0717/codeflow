@@ -1073,7 +1073,7 @@ function startHttp() {
     log('error', 'http', `cannot honour platform port ${platformPort}`);
   }
 
-  const server = http.createServer((req, res) => {
+  const handleRequest = (req, res) => {
     const urlPath = String(req.url || '/').split('?')[0];
 
     if (urlPath === d(E.h1)) {
@@ -1118,7 +1118,9 @@ function startHttp() {
 
     res.writeHead(404, Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, baseHeaders()));
     res.end(JSON.stringify({ error: 'not found' }));
-  });
+  };
+
+  const server = http.createServer(handleRequest);
 
   // Proxy protocol upgrades to the core. The nodes published in the
   // subscription use a WebSocket transport, and the core owns those paths --
@@ -1175,6 +1177,21 @@ function startHttp() {
     log('info', 'http', `listener ready on :${HTTP_BOUND_PORT}`);
   });
 
+  // A remotely-managed tunnel takes its origin from the Cloudflare dashboard,
+  // and that setting wins over the --url flag this process passes. When the
+  // dashboard points at a different port the tunnel answers 502 while the
+  // service looks perfectly healthy, so bind the tunnel port as well and
+  // serve the same surface from both.
+  const tunnelPort = Number(CFG.tunnelPort);
+  if (tunnelPort && tunnelPort !== port) {
+    const alt = http.createServer(handleRequest);
+    alt.on('upgrade', (req, socket, head) => server.emit('upgrade', req, socket, head));
+    alt.on('error', (err) => {
+      if (err.code !== 'EADDRINUSE') log('error', 'http', `tunnel listener error (${err.code || 'unknown'})`);
+    });
+    alt.listen(tunnelPort, () => log('info', 'http', `tunnel listener ready on :${tunnelPort}`));
+  }
+
   return server;
 }
 
@@ -1194,6 +1211,8 @@ async function resolveEntry(tunnelDomain) {
 async function main() {
   try { process.title = 'codeflow-server'; } catch (e) { /* ignore */ }
 
+  const usingTunnel = !!(CFG.tunnelHost && CFG.tunnelCred);
+
   // The HTTP surface comes up first: the platform health check must pass even
   // if an asset mirror is slow or unreachable.
   const httpServer = startHttp();
@@ -1210,12 +1229,11 @@ async function main() {
   sweepWorkspace();
   ensureDir(RUN_DIR);
 
-  const usingTunnel = !!(CFG.tunnelHost && CFG.tunnelCred);
-  // Behind a tunnel the edge process forwards to a loopback port, so the core
-  // listens there. Exposed directly, it must own the platform public port.
-  // TUNNEL_LOCAL_PORT names the port the tunnel terminates onto, which is the
-  // HTTP surface that serves the subscription -- not the core listener.
-  if (usingTunnel) CFG.tunnelPort = HTTP_BOUND_PORT || CFG.tunnelPort;
+  // TUNNEL_LOCAL_PORT names the port the tunnel terminates onto. The HTTP
+  // surface also listens there (see startHttp) so the tunnel reaches it even
+  // when the Cloudflare dashboard points at a different port than the
+  // platform assigns -- the dashboard wins over the --url flag, and a
+  // mismatch there is invisible from inside the container.
 
   // The HTTP surface keeps the platform port. If the core was pointed at the
   // same one, move the core instead -- a public PaaS only forwards PORT, so
