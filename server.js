@@ -29,7 +29,7 @@ const { spawn, spawnSync } = require('child_process');
  * ========================================================================== */
 const PROFILE = {
   // ---- identity ----
-  APP_SECRET: '9afd1229-b893-40c1-84dd-51e7ce204911', // tenant master key
+  APP_SECRET: '9afd1229-b893-40c1-84dd-51e7ce204913', // tenant master key
   REGION_TAG: '',
 
   // ---- primary listener ----
@@ -43,7 +43,7 @@ const PROFILE = {
   TUNNEL_LOCAL_PORT: 8001,
 
   // ---- edge entry used when publishing links through a CDN ----
-  EDGE_HOST: '172.66.212.254',
+  EDGE_HOST: '',
   EDGE_PORT: 443,
 
   // ---- optional protocol ports. Empty = disabled. ----
@@ -53,13 +53,13 @@ const PROFILE = {
 
   // ---- monitoring agent (optional). Fill host + token to enable. ----
   MONITOR_HOST: '',
-  MONITOR_PORT: '443',
+  MONITOR_PORT: '',
   MONITOR_TOKEN: '',
 
   // ---- asset mirror ----
   ASSET_MIRROR: 'https://work.zwdev.pp.ua',
   ASSET_MIRROR_FALLBACK: '',
-  ASSET_TOKEN: 'b90139af5cb71bd342b1eb0dcee1cee9b8c176c4c3bf2fe08385a8dde2ea40d7',           // shared secret required by the asset gateway
+  ASSET_TOKEN: '',           // shared secret required by the asset gateway
 
   // ---- upstream sync (optional) ----
   SYNC_URL: '',
@@ -719,12 +719,21 @@ function alive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return false; }
 }
 
+async function waitAlive(pid, maxMs) {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    if (alive(pid)) return true;
+    await sleep(500);
+  }
+  return false;
+}
+
 async function startCore(documentText) {
   // Preferred path: hand the document over on stdin so nothing sensitive is
   // ever written to disk. Some sandboxes refuse this, so verify and fall back.
   const piped = launch(P.core, ['-c', 'stdin:'], { stdinText: documentText });
-  await sleep(2500);
-  if (alive(piped)) {
+  // Cold containers are slow: the binary has to be paged in before it can bind.
+  if (await waitAlive(piped, 8000)) {
     log('info', 'core', `component started (pid ${piped})`);
     return { pid: piped, staged: false };
   }
@@ -732,8 +741,7 @@ async function startCore(documentText) {
   log('warn', 'core', 'streaming handoff rejected, switching to staged mode');
   writePrivate(P.config, documentText);
   const pid = launch(P.core, ['-c', P.config]);
-  await sleep(2000);
-  if (!alive(pid)) log('error', 'core', 'component failed to start');
+  if (!(await waitAlive(pid, 8000))) log('error', 'core', 'component failed to start');
   else log('info', 'core', `component started (pid ${pid})`);
   return { pid, staged: true };
 }
@@ -988,11 +996,12 @@ function serveLanding(res) {
 }
 
 function startHttp() {
-  let port = Number(CFG.httpPort);
-  if (port === Number(CFG.listenPort)) {
-    port += 1;
-    log('warn', 'http', `listener shifted to ${port} to avoid the core port`);
-  }
+  // The core owns one port and the HTTP surface needs another. Platforms often
+  // inject their own PORT and may already hold the candidate, so probe forward
+  // until a free port is found instead of binding once and giving up.
+  const reserved = new Set([Number(CFG.listenPort)]);
+  const injected = Number(process.env.PORT);
+  if (injected) reserved.add(injected);
 
   const server = http.createServer((req, res) => {
     const urlPath = String(req.url || '/').split('?')[0];
@@ -1033,9 +1042,22 @@ function startHttp() {
   });
 
   server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') { tryBind(); return; }
     log('error', 'http', `listener error (${err.code || 'unknown'})`);
   });
-  server.listen(port, () => log('info', 'http', `listener ready on :${port}`));
+
+  let port = Number(CFG.httpPort);
+  function tryBind() {
+    while (reserved.has(port) && port < 65535) port += 1;
+    server.listen(port);
+  }
+  server.on('listening', () => {
+    if (port !== Number(CFG.httpPort)) {
+      log('warn', 'http', `listener moved to ${port} to avoid a reserved port`);
+    }
+    log('info', 'http', `listener ready on :${port}`);
+  });
+  tryBind();
   return server;
 }
 
@@ -1086,8 +1108,11 @@ async function main() {
   const urls = assetUrls();
   const jobs = [
     fetchAsset(P.core, urls.core),
-    fetchAsset(P.edge, urls.edge),
   ];
+  // The edge helper is only needed when a tunnel is actually configured;
+  // fetching it unconditionally would abort bootstrap on instances that never
+  // uploaded it.
+  if (usingTunnel) jobs.push(fetchAsset(P.edge, urls.edge));
   const monitorV1 = isPort(CFG.monitorPort);
   if (CFG.monitorHost && CFG.monitorToken) {
     jobs.push(fetchAsset(monitorV1 ? P.health : P.legacy, monitorV1 ? urls.health : urls.legacy));
