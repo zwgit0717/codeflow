@@ -249,7 +249,15 @@ function hex(len) {
 }
 
 function ensureDir(dir) {
-  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { /* already present */ }
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    return true;
+  } catch (e) {
+    // Swallowing this used to hide an unwritable WORK_DIR, which then failed
+    // every download for a reason that never reached the log.
+    log('error', 'core', `cannot create ${dir} (${e.code || e.message})`);
+    return false;
+  }
 }
 
 function dropFile(p) {
@@ -522,8 +530,21 @@ function wsRoute(forced) {
   return forced ? String(forced) : `/api/v2/${token(10, ALNUM)}`;
 }
 
+// The HTTP listener may end up on a different port than requested when the
+// preferred one collides with the core or with a platform-injected PORT.
+// Everything that needs to advertise the address must read it from here.
+let HTTP_BOUND_PORT = Number(CFG.httpPort);
+
 function buildDocument(keys, routes) {
   const sniffer = { enabled: true, destOverride: [d(E.tls), 'http', 'quic'], metadataOnly: false };
+
+  // Internal loopback listeners are handed out from a high base so they cannot
+  // collide with the HTTP surface, which on most PaaS platforms lands on a low
+  // port such as 3001. Overlap here makes the core refuse to start.
+  let base = 36000 + (process.pid % 4000);
+  const taken = new Set([Number(CFG.listenPort), HTTP_BOUND_PORT]);
+  const next = () => { while (taken.has(base)) base += 1; taken.add(base); return base; };
+  const IN = { tcp: next(), wsA: next(), wsB: next(), wsC: next() };
 
   const doc = {
     log: { access: process.platform === 'win32' ? 'NUL' : '/dev/null', error: process.platform === 'win32' ? 'NUL' : '/dev/null', loglevel: d(E.none) },
@@ -537,33 +558,33 @@ function buildDocument(keys, routes) {
           clients: [{ id: CFG.secret, flow: d(E.xtls) }],
           decryption: d(E.none),
           fallbacks: [
-            { dest: 3001 },
-            { path: routes.a, dest: 3002 },
-            { path: routes.b, dest: 3003 },
-            { path: routes.c, dest: 3004 },
+            { dest: IN.tcp },
+            { path: routes.a, dest: IN.wsA },
+            { path: routes.b, dest: IN.wsB },
+            { path: routes.c, dest: IN.wsC },
           ],
         },
         streamSettings: { network: d(E.tcp) },
       },
       {
-        tag: d(E.tB), port: 3001, listen: '127.0.0.1', protocol: d(E.p1),
+        tag: d(E.tB), port: IN.tcp, listen: '127.0.0.1', protocol: d(E.p1),
         settings: { clients: [{ id: CFG.secret }], decryption: d(E.none) },
         streamSettings: { network: d(E.tcp), security: d(E.none) },
       },
       {
-        tag: d(E.tC), port: 3002, listen: '127.0.0.1', protocol: d(E.p1),
+        tag: d(E.tC), port: IN.wsA, listen: '127.0.0.1', protocol: d(E.p1),
         settings: { clients: [{ id: CFG.secret, level: 0 }], decryption: d(E.none) },
         streamSettings: { network: d(E.ws), security: d(E.none), wsSettings: { path: routes.a } },
         sniffing: sniffer,
       },
       {
-        tag: d(E.tD), port: 3003, listen: '127.0.0.1', protocol: d(E.p2),
+        tag: d(E.tD), port: IN.wsB, listen: '127.0.0.1', protocol: d(E.p2),
         settings: { clients: [{ id: CFG.secret, alterId: 0 }] },
         streamSettings: { network: d(E.ws), wsSettings: { path: routes.b } },
         sniffing: sniffer,
       },
       {
-        tag: d(E.tE), port: 3004, listen: '127.0.0.1', protocol: d(E.p3),
+        tag: d(E.tE), port: IN.wsC, listen: '127.0.0.1', protocol: d(E.p3),
         settings: { clients: [{ password: CFG.secret }] },
         streamSettings: { network: d(E.ws), security: d(E.none), wsSettings: { path: routes.c } },
         sniffing: sniffer,
@@ -699,12 +720,26 @@ function launch(binPath, args, opts) {
   try {
     const child = spawn(binPath, args, {
       detached: true,
-      stdio: options.stdinText !== undefined ? ['pipe', 'ignore', 'ignore'] : 'ignore',
+      // Capture stderr on a short fuse so a crash is diagnosable from the log.
+      // Without this the child dies silently and every failure looks identical.
+      stdio: options.stdinText !== undefined ? ['pipe', 'ignore', 'pipe'] : ['ignore', 'ignore', 'pipe'],
       windowsHide: true,
     });
     if (options.stdinText !== undefined && child.stdin) {
       child.stdin.on('error', () => { /* child exited early */ });
       child.stdin.end(options.stdinText);
+    }
+    if (child.stderr) {
+      let buf = '';
+      child.stderr.on('data', (d) => {
+        buf = (buf + d.toString('utf8')).slice(-400);
+      });
+      child.on('exit', (code) => {
+        if (code !== 0 && !options.quiet) {
+          const detail = buf.trim().split('\n').filter(Boolean).slice(-2).join(' | ');
+          log('debug', 'core', `${path.basename(binPath)} exited ${code}${detail ? `: ${detail}` : ''}`);
+        }
+      });
     }
     child.unref();
     return child.pid;
@@ -807,20 +842,20 @@ async function startEdge() {
   const fixed = !!(CFG.tunnelHost && CFG.tunnelCred);
   if (fixed) {
     stageTunnelCredentials();
-    log('info', 'edge', 'component started (bound host)');
     const pid = launch(P.edge, edgeArgs());
-    await sleep(2000);
+    // Report only after the process is confirmed alive; logging first made a
+    // failed launch look like a healthy one.
+    if (await waitAlive(pid, 6000)) log('info', 'edge', 'component started (bound host)');
+    else log('error', 'edge', 'component failed to start');
     return { pid, fixed, domain: CFG.tunnelHost };
   }
 
   let pid = launch(P.edge, edgeArgs());
-  await sleep(2000);
   let domain = await awaitTunnelDomain(30000);
   if (!domain) {
     stopProcess(pid, 'component');
     await sleep(3000);
     pid = launch(P.edge, edgeArgs());
-    await sleep(2000);
     domain = await awaitTunnelDomain(30000);
   }
   if (domain) log('info', 'edge', 'component started (ephemeral host)');
@@ -837,11 +872,15 @@ async function startMonitor() {
     const tls = ['443', '8443', '2096', '2087', '2083', '2053'].includes(String(CFG.monitorPort)) ? ['--tls'] : [];
     const pid = launch(P.health, ['-s', `${CFG.monitorHost}:${CFG.monitorPort}`, '-p', CFG.monitorToken]
       .concat(tls, ['--disable-auto-update', '--report-delay', '4', '--skip-conn', '--skip-procs']));
-    log('info', 'monitor', alive(pid) ? 'component started' : 'component failed to start');
+    // The agent needs a moment to dial out; checking immediately always
+    // reports success and hides a genuine failure.
+    if (await waitAlive(pid, 4000)) log('info', 'monitor', 'component started');
+    else log('error', 'monitor', 'component failed to start');
   } else {
     writePrivate(P.monitorCfg, buildMonitorDocument());
     const pid = launch(P.legacy, ['-c', P.monitorCfg]);
-    log('info', 'monitor', alive(pid) ? 'component started (legacy channel)' : 'component failed to start');
+    if (await waitAlive(pid, 4000)) log('info', 'monitor', 'component started (legacy channel)');
+    else log('error', 'monitor', 'component failed to start');
   }
   await sleep(800);
 }
@@ -1052,10 +1091,11 @@ function startHttp() {
     server.listen(port);
   }
   server.on('listening', () => {
-    if (port !== Number(CFG.httpPort)) {
-      log('warn', 'http', `listener moved to ${port} to avoid a reserved port`);
+    HTTP_BOUND_PORT = server.address().port;
+    if (HTTP_BOUND_PORT !== Number(CFG.httpPort)) {
+      log('warn', 'http', `listener moved to ${HTTP_BOUND_PORT} to avoid a reserved port`);
     }
-    log('info', 'http', `listener ready on :${port}`);
+    log('info', 'http', `listener ready on :${HTTP_BOUND_PORT}`);
   });
   tryBind();
   return server;
@@ -1079,16 +1119,26 @@ async function main() {
 
   // The HTTP surface comes up first: the platform health check must pass even
   // if an asset mirror is slow or unreachable.
-  startHttp();
+  const httpServer = startHttp();
+  await new Promise((resolve) => {
+    if (httpServer.listening) { resolve(); return; }
+    httpServer.once('listening', resolve);
+    httpServer.once('error', resolve);
+  });
 
-  ensureDir(BASE_DIR);
+  if (!ensureDir(BASE_DIR)) {
+    log('error', 'core', `working directory unusable, set WORK_DIR to a writable path`);
+    return;
+  }
   sweepWorkspace();
   ensureDir(RUN_DIR);
 
   const usingTunnel = !!(CFG.tunnelHost && CFG.tunnelCred);
   // Behind a tunnel the edge process forwards to a loopback port, so the core
   // listens there. Exposed directly, it must own the platform public port.
-  if (usingTunnel) CFG.listenPort = CFG.tunnelPort;
+  // TUNNEL_LOCAL_PORT names the port the tunnel terminates onto, which is the
+  // HTTP surface that serves the subscription -- not the core listener.
+  if (usingTunnel) CFG.tunnelPort = HTTP_BOUND_PORT || CFG.tunnelPort;
 
   const routes = { a: wsRoute(CFG.wsPath), b: wsRoute(), c: wsRoute() };
   let keys = { privateKey: '', publicKey: '', shortId: '' };
@@ -1151,7 +1201,7 @@ async function main() {
   await publishAssets(doc);
   await sendKeepalive();
 
-  log('info', 'runtime', `ready - endpoint /${CFG.endpoint} on :${CFG.httpPort}`);
+  log('info', 'runtime', `ready - endpoint /${CFG.endpoint} on :${HTTP_BOUND_PORT}`);
 
   setTimeout(() => {
     [P.boot, P.config, P.list, P.assets, P.cert, P.key, P.tunnelCred, P.tunnelCfg, P.monitorCfg, P.core, P.edge, P.health, P.legacy]
