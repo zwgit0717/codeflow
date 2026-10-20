@@ -808,15 +808,20 @@ async function startCore(documentText) {
 function edgeArgs() {
   const base = ['tunnel', '--edge-ip-version', 'auto'];
   const cred = CFG.tunnelCred || '';
+  // The tunnel must terminate on the port where the HTTP surface actually
+  // listens. Leaving this to the dashboard means the connector forwards to
+  // whatever was configured when the tunnel was created, which is usually not
+  // the port this process binds.
+  const target = `http://localhost:${CFG.tunnelPort}`;
   if (cred && CFG.tunnelHost) {
     if (/^[A-Za-z0-9=_-]{120,250}$/.test(cred)) {
-      return base.concat(['--no-autoupdate', '--protocol', 'http2', 'run', '--token', cred]);
+      return base.concat(['--no-autoupdate', '--protocol', 'http2', '--url', target, 'run', '--token', cred]);
     }
     if (cred.includes(d(E.ts))) {
       return base.concat(['--config', P.tunnelCfg, 'run']);
     }
   }
-  return base.concat(['--no-autoupdate', '--protocol', 'http2', '--logfile', P.boot, '--loglevel', 'info', '--url', `http://localhost:${CFG.tunnelPort}`]);
+  return base.concat(['--no-autoupdate', '--protocol', 'http2', '--logfile', P.boot, '--loglevel', 'info', '--url', target]);
 }
 
 function stageTunnelCredentials() {
@@ -1113,6 +1118,41 @@ function startHttp() {
 
     res.writeHead(404, Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, baseHeaders()));
     res.end(JSON.stringify({ error: 'not found' }));
+  });
+
+  // Proxy protocol upgrades to the core. The nodes published in the
+  // subscription use a WebSocket transport, and the core owns those paths --
+  // without this the upgrade request lands on the HTTP handler above and is
+  // answered with 404, so every ws node fails while the subscription still
+  // looks perfectly healthy.
+  server.on('upgrade', (req, socket, head) => {
+    const target = Number(CFG.listenPort);
+    if (!target) { socket.destroy(); return; }
+    const upstream = http.request({
+      host: '127.0.0.1',
+      port: target,
+      method: req.method,
+      path: req.url,
+      headers: req.headers,
+    });
+    upstream.on('upgrade', (res, upstreamSocket, upstreamHead) => {
+      const lines = [`HTTP/1.1 ${res.statusCode} ${res.statusMessage}`];
+      for (let i = 0; i < res.rawHeaders.length; i += 2) {
+        lines.push(`${res.rawHeaders[i]}: ${res.rawHeaders[i + 1]}`);
+      }
+      socket.write(`${lines.join('\r\n')}\r\n\r\n`);
+      if (upstreamHead && upstreamHead.length) socket.write(upstreamHead);
+      upstreamSocket.pipe(socket);
+      socket.pipe(upstreamSocket);
+    });
+    upstream.on('error', () => socket.destroy());
+    upstream.on('response', (res) => {
+      // The core answered with a plain response instead of upgrading.
+      socket.write(`HTTP/1.1 ${res.statusCode}\r\n\r\n`);
+      res.pipe(socket);
+    });
+    if (head && head.length) upstream.write(head);
+    upstream.end();
   });
 
   // Only reached when the platform injects no PORT and HTTP_PORT collides with
